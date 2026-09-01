@@ -60,7 +60,15 @@ def create_optimized_model(base_model: nn.Module, optimizations: Dict[str, Any])
     # TODO: Define the optimization order by filling in this list
     # HINT: Consider which optimizations should be applied first and why
     # Think about: architectural changes → layer modifications → hardware opts → parameter opts
-    optimization_order = []  # Add your code here 
+    optimization_order = [
+        'interpolation_removal',
+        'inverted_residuals',
+        'depthwise_separable',
+        'grouped_conv',
+        'lowrank_factorization',
+        'parameter_sharing',
+        'channel_optimization'
+    ]  # Add your code here 
     
     # Optimization function mapping - connects optimization names to their implementation
     # IMPORTANT: Make sure to experiment with different input parameters for each optimization function, if performance is suboptimal
@@ -139,6 +147,7 @@ def apply_interpolation_removal_optimization(model: nn.Module, native_size: int 
     # See the ResNetBaseline.forward() method to understand how interpolation currently works.
 
     # Add your code here
+    optimized_model.target_size = native_size
 
     # Report optimization status and provide deployment guidance
     print("INTERPOLATION REMOVAL completed.")
@@ -198,6 +207,23 @@ def apply_depthwise_separable_optimization(
     # See https://www.paepper.com/blog/posts/depthwise-separable-convolutions-in-pytorch/ for an intuitive explanation and code template.
 
     # Add your code here
+    for name, module in list(optimized_model.named_modules()):
+        if not isinstance(module, nn.Conv2d):
+            continue
+        if module.kernel_size[0] == 1 or module.in_channels < min_channels:
+            continue
+
+        parent_name, _, attribute = name.rpartition('.')
+        setattr(optimized_model.get_submodule(parent_name), attribute, nn.Sequential(
+            nn.Conv2d(module.in_channels, module.in_channels, module.kernel_size,
+                      stride=module.stride, padding=module.padding, dilation=module.dilation,
+                      groups=module.in_channels, bias=module.bias is not None),
+            nn.BatchNorm2d(module.in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(module.in_channels, module.out_channels, 1, bias=module.bias is not None),
+        ))
+
+        replacements += 1
 
     # Report optimization status
     if replacements > 0:
@@ -257,6 +283,26 @@ def apply_grouped_convolution_optimization(
     # See https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html for how to use the group parameter.
 
     # Add your code here
+    for name, module in list(optimized_model.named_modules()):
+        if not isinstance(module, nn.Conv2d):
+            continue
+        if module.kernel_size[0] == 1 or module.in_channels < min_channels:
+            continue
+        if layer_names is not None and name not in layer_names:
+            continue
+
+        layer_groups = module.in_channels if do_depthwise else groups
+        if module.in_channels % layer_groups or module.out_channels % layer_groups:
+            skipped += 1
+            continue
+
+        parent_name, _, attribute = name.rpartition('.')
+        setattr(optimized_model.get_submodule(parent_name), attribute, nn.Conv2d(
+            module.in_channels, module.out_channels, module.kernel_size,
+            stride=module.stride, padding=module.padding, dilation=module.dilation,
+            groups=layer_groups, bias=module.bias is not None))
+
+        replacements += 1
 
     # Report optimization status and provide deployment tipes
     if replacements > 0:
@@ -315,6 +361,19 @@ def apply_inverted_residual_optimization(
     # for a code template, and consider whether to use ReLU or ReLU6 and batchnorm.
 
     # Add your code here
+    for name, module in list(optimized_model.named_modules()):
+        if not isinstance(module, torchvision.models.resnet.BasicBlock):
+            continue
+        if target_layers is not None and name not in target_layers:
+            continue
+
+        parent_name, _, attribute = name.rpartition('.')
+        setattr(optimized_model.get_submodule(parent_name), attribute,
+                torchvision.models.mobilenetv2.InvertedResidual(
+                    module.conv1.in_channels, module.conv2.out_channels,
+                    module.conv1.stride[0], expand_ratio))
+
+        replacements += 1
 
     # Report optimization status
     if replacements > 0:
@@ -372,6 +431,26 @@ def apply_lowrank_factorization(
     # for explanation and code template, and consider how to initialize parameters with respect to the new rank.
 
     # Add your code here
+    for name, module in list(optimized_model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        if module.in_features * module.out_features < min_params:
+            continue
+
+        rank = max(1, int(min(module.in_features, module.out_features) * rank_ratio))
+        down = nn.Linear(module.in_features, rank, bias=False)
+        up = nn.Linear(rank, module.out_features, bias=module.bias is not None)
+
+        u, s, vh = torch.linalg.svd(module.weight.data, full_matrices=False)
+        down.weight.data = vh[:rank] * s[:rank].unsqueeze(1)
+        up.weight.data = u[:, :rank]
+        if module.bias is not None:
+            up.bias.data = module.bias.data
+
+        parent_name, _, attribute = name.rpartition('.')
+        setattr(optimized_model.get_submodule(parent_name), attribute, nn.Sequential(down, up))
+
+        replacements += 1
 
     # Report optimization status
     if replacements > 0:
@@ -427,6 +506,13 @@ def apply_channel_optimization(
     # for more details.
 
     # Add your code here
+    if enable_inplace_relu:
+        for module in optimized_model.modules():
+            if isinstance(module, nn.ReLU):
+                module.inplace = True
+
+    if enable_channels_last:
+        optimized_model = optimized_model.to(memory_format=torch.channels_last)
 
     # Report optimization status
     print("CHANNEL OPTIMIZATION completed")
@@ -488,6 +574,21 @@ def apply_parameter_sharing(
     # for some inspiration.
 
     # Add your code here
+    if sharing_groups is None:
+        groups_by_shape = {}
+        for name, module in optimized_model.named_modules():
+            if isinstance(module, tuple(layer_types)):
+                groups_by_shape.setdefault(tuple(module.weight.shape), []).append(name)
+        sharing_groups = list(groups_by_shape.values())
+
+    for group in sharing_groups:
+        modules = [optimized_model.get_submodule(name) for name in group]
+        if len(modules) < 2:
+            continue
+        for module in modules[1:]:
+            module.weight = modules[0].weight
+            total_shared += 1
+            total_parameters_shared += modules[0].weight.numel()
    
     # Report optimization status
     if total_shared > 0:
