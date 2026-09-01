@@ -30,5 +30,5 @@ medmnist>=2.1.2                  # Benchmark medical image datasets
 
 # Model export and inference optimization
 onnx>=1.15.0                     # Export PyTorch models
-onnxruntime>=1.16.0              # Run ONNX models efficiently
+onnxruntime-gpu>=1.16.0              # Run ONNX models efficiently
 tensorrt-cu12==10.0.1            # TensorRT backend for CUDA 12, CUDNN 8.9.2, NVIDIA driver 550, python 3.10
